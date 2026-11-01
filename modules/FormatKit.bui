@@ -1,0 +1,567 @@
+Import moneykit
+
+Public Enum FormatState As Integer
+    Empty = 0
+    Incomplete = 1
+    Valid = 2
+    Invalid = 3
+End Enum
+
+Public Class FormatAnalysis
+    Public Property State As FormatState = FormatState.Invalid
+    Public Property Code As String = "syntax"
+    Public Property Position As Integer = 0
+    Public Property Canonical As String = ""
+    Public Property IntegerValue As Integer = 0
+    Public Property MoneyValue As Currency = Currency.Zero
+    Public Property NumberValue As Double = 0.0
+End Class
+
+Public Class FormatProfile
+    Public Property Language As String = "en"
+    Public Property NumberLocale As String = "invariant"
+    Public Property ResolvedNumberLocale As String = "invariant"
+    Public Property DateLocale As String = "explicit"
+    Public Property CurrencyCode As String = "USD"
+    Public Property DecimalSeparator As String = "."
+    Public Property GroupingSeparator As String = ","
+    Public Property PrimaryGroup As Integer = 3
+    Public Property SecondaryGroup As Integer = 3
+    Public Property Grouping As Boolean = True
+    Public Property Accounting As Boolean = False
+    Public Property MinFraction As Integer = 0
+    Public Property MaxFraction As Integer = 2
+    Public Property Rounding As MoneyRoundingMode = MoneyRoundingMode.HalfEven
+    Public Property CurrencyDigitsOverride As Integer = -1
+    Public Property CurrencySymbolOverride As String = ""
+    Public Property CurrencySuffix As Boolean = False
+    Public Property CurrencySpace As Boolean = True
+    Public Property DatePattern As String = "yyyy-MM-dd"
+    Public Property TimePattern As String = "HH:mm:ss"
+    Public Property TimeEditPattern As String = "HH:mm:ss.fff"
+    Public Property TimeZoneIdentity As String = "UTC"
+    Public Property Provenance As String = "explicit"
+
+    Public Function Clone() As FormatProfile
+        Dim copy As New FormatProfile()
+        copy.Language = Me.Language
+        copy.NumberLocale = Me.NumberLocale
+        copy.ResolvedNumberLocale = Me.ResolvedNumberLocale
+        copy.DateLocale = Me.DateLocale
+        copy.CurrencyCode = Me.CurrencyCode
+        copy.DecimalSeparator = Me.DecimalSeparator
+        copy.GroupingSeparator = Me.GroupingSeparator
+        copy.PrimaryGroup = Me.PrimaryGroup
+        copy.SecondaryGroup = Me.SecondaryGroup
+        copy.Grouping = Me.Grouping
+        copy.Accounting = Me.Accounting
+        copy.MinFraction = Me.MinFraction
+        copy.MaxFraction = Me.MaxFraction
+        copy.Rounding = Me.Rounding
+        copy.CurrencyDigitsOverride = Me.CurrencyDigitsOverride
+        copy.CurrencySymbolOverride = Me.CurrencySymbolOverride
+        copy.CurrencySuffix = Me.CurrencySuffix
+        copy.CurrencySpace = Me.CurrencySpace
+        copy.DatePattern = Me.DatePattern
+        copy.TimePattern = Me.TimePattern
+        copy.TimeEditPattern = Me.TimeEditPattern
+        copy.TimeZoneIdentity = Me.TimeZoneIdentity
+        copy.Provenance = Me.Provenance
+        Return copy
+    End Function
+
+    Public Function CurrencyDigits() As Integer
+        If CurrencyDigitsOverride >= 0 Then Return CurrencyDigitsOverride
+        Select Case CurrencyCode
+            Case "USD", "EUR", "GBP", "CHF", "CAD", "AUD"
+                Return 2
+            Case "JPY"
+                Return 0
+            Case "KWD", "BHD"
+                Return 3
+            Case "CLF"
+                Return 4
+        End Select
+        Throw New InvalidArgumentException("Unknown currency requires precision override")
+    End Function
+
+    Public Sub Validate()
+        If String.Len(DecimalSeparator) <> 1 Or String.Len(GroupingSeparator) <> 1 Then Throw New InvalidArgumentException("Separators require one codepoint")
+        If String.Compare(DecimalSeparator, GroupingSeparator, True) = 0 Then Throw New InvalidArgumentException("Separators collide")
+        For Each sep As String In [DecimalSeparator, GroupingSeparator]
+            If String.Contains("0123456789+-()%eE", sep, True) Then Throw New InvalidArgumentException("Reserved separator")
+            If String.Asc(sep) < 32 Then Throw New InvalidArgumentException("Control separator")
+        Next
+        If PrimaryGroup < 1 Or PrimaryGroup > 9 Or SecondaryGroup < 1 Or SecondaryGroup > 9 Then Throw New InvalidArgumentException("Group size 1..9")
+        If MinFraction < 0 Or MaxFraction < MinFraction Or MaxFraction > 15 Then Throw New InvalidArgumentException("Fraction limits 0..15")
+        If CType(Rounding, Integer) < 0 Or CType(Rounding, Integer) > 4 Then Throw New InvalidArgumentException("Rounding mode")
+        If CurrencyDigitsOverride < -1 Or CurrencyDigitsOverride > 4 Then Throw New InvalidArgumentException("Currency precision 0..4")
+        If String.Len(CurrencyCode) <> 3 Then Throw New InvalidArgumentException("Three uppercase currency letters")
+        For Each c As String In String.Chars(CurrencyCode)
+            If String.Asc(c) < 65 Or String.Asc(c) > 90 Then Throw New InvalidArgumentException("Currency code uppercase ASCII")
+        Next
+        Dim digits As Integer = CurrencyDigits()
+        If String.Len(CurrencySymbolOverride) > 16 Then Throw New InvalidArgumentException("Currency symbol exceeds 16 codepoints")
+        For Each c As String In String.Chars(CurrencySymbolOverride)
+            If String.Contains("0123456789+-()%", c, True) Or String.Compare(c, DecimalSeparator, True) = 0 Or String.Compare(c, GroupingSeparator, True) = 0 Or String.Trim(c) = "" Then Throw New InvalidArgumentException("Unsafe currency symbol")
+            If String.Asc(c) < 32 Then Throw New InvalidArgumentException("Control currency symbol")
+        Next
+        If Language = "" Or NumberLocale = "" Or ResolvedNumberLocale = "" Or DateLocale = "" Or TimeZoneIdentity = "" Then Throw New InvalidArgumentException("Empty identity")
+    End Sub
+
+    Public Shared Function Invariant() As FormatProfile
+        Return New FormatProfile()
+    End Function
+
+    Public Shared Function ResolveSystem(primary As Integer = 3, secondary As Integer = 3) As FormatProfile
+        Dim loc As Locale
+        Dim source As String = "host-current"
+#If TargetLinux Then
+        ' CW2-DATA-003 workaround: Current ignores fresh POSIX preference state.
+        Dim identifier As String = System.EnvironmentVariable("LC_ALL").Or("")
+        source = "LC_ALL"
+        If identifier = "" Then
+            identifier = System.EnvironmentVariable("LC_NUMERIC").Or("")
+            source = "LC_NUMERIC"
+        End If
+        If identifier = "" Then
+            identifier = System.EnvironmentVariable("LANG").Or("")
+            source = "LANG"
+        End If
+        If identifier <> "" Then
+            source += ":" + identifier
+            Dim suffix As Integer = String.IndexOf(identifier, ".")
+            If suffix >= 0 Then identifier = String.Left(identifier, suffix)
+            suffix = String.IndexOf(identifier, "@")
+            If suffix >= 0 Then identifier = String.Left(identifier, suffix)
+            loc = New Locale(identifier)
+        Else
+            source = "host-current"
+            loc = Locale.Current()
+        End If
+#Else
+        loc = Locale.Current()
+#End If
+        Dim p As FormatProfile = FormatProfile.ResolveHost(loc, primary, secondary)
+        p.NumberLocale = "system"
+        p.Provenance = source + ";caller-group-sizes"
+        Return p
+    End Function
+
+    Public Shared Function ResolveHost(loc As Locale, primary As Integer = 3, secondary As Integer = 3) As FormatProfile
+        If loc Is Nil Then Throw New InvalidArgumentException("Nil locale")
+        Dim p As New FormatProfile()
+        p.NumberLocale = loc.Identifier
+        p.ResolvedNumberLocale = loc.Identifier
+        p.DecimalSeparator = loc.DecimalSeparator
+        p.GroupingSeparator = loc.GroupingSeparator
+        ' Empty host grouping convention means no grouping; retain a safe separator.
+        If p.GroupingSeparator = "" Then
+            p.Grouping = False
+            p.GroupingSeparator = ","
+            If p.DecimalSeparator = "," Then p.GroupingSeparator = "."
+        End If
+        p.PrimaryGroup = primary
+        p.SecondaryGroup = secondary
+        p.Provenance = "host:" + loc.Identifier + ";caller-group-sizes"
+        p.Validate()
+        Return p
+    End Function
+End Class
+
+Public Class NumericCodec
+    Private Property Config As FormatProfile
+
+    Public Sub Constructor(profile As FormatProfile)
+        If profile Is Nil Then Throw New InvalidArgumentException("Nil profile")
+        Config = profile.Clone()
+        Config.Validate()
+    End Sub
+
+    Public Function Profile() As FormatProfile
+        Return Config.Clone()
+    End Function
+
+    Private Function Affix() As String
+        If Config.CurrencySymbolOverride <> "" Then Return Config.CurrencySymbolOverride
+        Return Config.CurrencyCode
+    End Function
+
+    Private Function MoneyPrefix() As String
+        If Config.CurrencySuffix Then Return ""
+        Dim affixText As String = Affix()
+        If Config.CurrencySpace Then affixText += " "
+        Return affixText
+    End Function
+
+    Private Function MoneySuffix() As String
+        If Not Config.CurrencySuffix Then Return ""
+        Dim affixText As String = Affix()
+        If Config.CurrencySpace Then affixText = " " + affixText
+        Return affixText
+    End Function
+
+    Private Function Localize(text As String, grouped As Boolean, prefix As String = "", suffix As String = "") As String
+        Dim negative As Boolean = String.StartsWith(text, "-")
+        Dim body As String = text
+        If negative Then body = String.Substring(body, 1)
+        Dim dot As Integer = String.IndexOf(body, ".")
+        Dim whole As String = body
+        Dim fraction As String = ""
+        If dot >= 0 Then
+            whole = String.Left(body, dot)
+            fraction = Config.DecimalSeparator + String.Substring(body, dot + 1)
+        End If
+        If grouped And Config.Grouping Then
+            Dim tail As String = ""
+            Dim size As Integer = Config.PrimaryGroup
+            While String.Len(whole) > size
+                tail = Config.GroupingSeparator + String.Right(whole, size) + tail
+                whole = String.Left(whole, String.Len(whole) - size)
+                size = Config.SecondaryGroup
+            End While
+            whole += tail
+        End If
+        body = prefix + whole + fraction + suffix
+        If negative Then
+            If Config.Accounting Then Return "(" + body + ")"
+            Return "-" + body
+        End If
+        Return body
+    End Function
+
+    Public Function IntegerInvariant(value As Integer) As String
+        Return Str(value)
+    End Function
+    Public Function IntegerEdit(value As Integer) As String
+        Return Localize(Str(value), False)
+    End Function
+    Public Function IntegerDisplay(value As Integer) As String
+        Return Localize(Str(value), True)
+    End Function
+    Public Function MoneyInvariant(value As Currency) As String
+        Return Money.Format(value, 4)
+    End Function
+    Public Function MoneyEdit(value As Currency) As String
+        Return Localize(MoneyInvariant(value), False, MoneyPrefix(), MoneySuffix())
+    End Function
+    Public Function MoneyDisplay(value As Currency) As String
+        Return Localize(Money.Format(value, Config.CurrencyDigits(), Config.Rounding), True, MoneyPrefix(), MoneySuffix())
+    End Function
+
+    Private Shared Function Zeros(count As Integer) As String
+        Dim s As String = ""
+        For i As Integer = 1 To count
+            s += "0"
+        Next
+        Return s
+    End Function
+
+    ' Expand an invariant decimal/exponent representation without floating arithmetic.
+    Private Shared Function Shift(text As String, places As Integer) As String
+        Dim sign As String = ""
+        Dim body As String = text
+        If String.StartsWith(body, "-") Then
+            sign = "-"
+            body = String.Substring(body, 1)
+        End If
+        Dim exp As Integer = String.IndexOf(String.UCase(body), "E")
+        Dim power As Integer = places
+        If exp >= 0 Then
+            power += Integer.Parse(String.Substring(body, exp + 1)).Value
+            body = String.Left(body, exp)
+        End If
+        Dim point As Integer = String.IndexOf(body, ".")
+        If point < 0 Then point = String.Len(body)
+        body = String.Replace(body, ".", "")
+        point += power
+        If point <= 0 Then
+            body = "0." + NumericCodec.Zeros(-point) + body
+        ElseIf point >= String.Len(body) Then
+            body += NumericCodec.Zeros(point - String.Len(body))
+        Else
+            body = String.Left(body, point) + "." + String.Substring(body, point)
+        End If
+        While String.Len(body) > 1 And String.StartsWith(body, "0") And String.Substring(body, 1, 1) <> "."
+            body = String.Substring(body, 1)
+        End While
+        If String.Contains(body, ".") Then
+            While String.EndsWith(body, "0")
+                body = String.Left(body, String.Len(body) - 1)
+            End While
+            If String.EndsWith(body, ".") Then body = String.Left(body, String.Len(body) - 1)
+        End If
+        If body = "0" Then sign = ""
+        Return sign + body
+    End Function
+
+    Public Function NumberInvariant(value As Double) As String
+        If value <> value Or value > 1.7976931348623157e308 Or value < -1.7976931348623157e308 Then Throw New InvalidArgumentException("Finite Double required")
+        If value = 0.0 Then Return "0"
+        ' Search increasing precision and require exact parse-back. This adapts to
+        ' both the known exponent-placeholder counting bug and a corrected engine;
+        ' no particular incorrect placeholder count is required by production.
+        For precision As Integer = 0 To 17
+            Dim mask As String = "0"
+            If precision > 0 Then mask += "." + NumericCodec.Zeros(precision)
+            mask += "E-00"
+            Dim rendered As String = String.Format(value, mask)
+            If String.StartsWith(rendered, "+") Then rendered = String.Substring(rendered, 1)
+            Dim text As String = NumericCodec.Shift(rendered, 0)
+            Dim parsed As Result Of Double, String = Double.Parse(text)
+            If parsed.IsOk Then
+                If parsed.Value = value Then Return text
+            End If
+        Next
+        Throw New InvalidArgumentException("Toolchain decimal conversion lost precision")
+    End Function
+    Public Function NumberEdit(value As Double) As String
+        Return Localize(NumberInvariant(value), False)
+    End Function
+
+    Private Function RoundDecimal(text As String) As String
+        Dim negative As Boolean = String.StartsWith(text, "-")
+        Dim body As String = text
+        If negative Then body = String.Substring(body, 1)
+        Dim point As Integer = String.IndexOf(body, ".")
+        If point < 0 Then point = String.Len(body)
+        Dim digits As String = String.Replace(body, ".", "")
+        Dim keep As Integer = point + Config.MaxFraction
+        digits += NumericCodec.Zeros(keep - String.Len(digits))
+        Dim discarded As String = String.Substring(digits, keep)
+        Dim retained As String = String.Left(digits, keep)
+        Dim nonzero As Boolean = False
+        For Each c As String In String.Chars(discarded)
+            If c <> "0" Then nonzero = True
+        Next
+        Dim up As Boolean = False
+        If nonzero Then
+            Select Case Config.Rounding
+                Case MoneyRoundingMode.Floor
+                    up = negative
+                Case MoneyRoundingMode.Ceiling
+                    up = Not negative
+                Case MoneyRoundingMode.HalfEven, MoneyRoundingMode.HalfAway
+                    Dim first As Integer = String.Asc(discarded) - 48
+                    up = first > 5
+                    If first = 5 Then
+                        up = Config.Rounding = MoneyRoundingMode.HalfAway Or (String.Asc(String.Right(retained, 1)) Mod 2 = 1)
+                        For Each c As String In String.Chars(String.Substring(discarded, 1))
+                            If c <> "0" Then up = True
+                        Next
+                    End If
+            End Select
+        End If
+        If up Then
+            Dim i As Integer = String.Len(retained) - 1
+            While i >= 0 And String.Substring(retained, i, 1) = "9"
+                retained = String.Left(retained, i) + "0" + String.Substring(retained, i + 1)
+                i -= 1
+            End While
+            If i < 0 Then
+                retained = "1" + retained
+            Else
+                retained = String.Left(retained, i) + String.Chr(String.Asc(String.Substring(retained, i, 1)) + 1) + String.Substring(retained, i + 1)
+            End If
+        End If
+        If Config.MaxFraction > 0 Then
+            Dim split As Integer = String.Len(retained) - Config.MaxFraction
+            retained = String.Left(retained, split) + "." + String.Substring(retained, split)
+            Dim n As Integer = Config.MaxFraction
+            While n > Config.MinFraction And String.EndsWith(retained, "0")
+                retained = String.Left(retained, String.Len(retained) - 1)
+                n -= 1
+            End While
+            If String.EndsWith(retained, ".") Then retained = String.Left(retained, String.Len(retained) - 1)
+        End If
+        If negative And String.Replace(String.Replace(retained, ".", ""), "0", "") <> "" Then retained = "-" + retained
+        Return retained
+    End Function
+
+    Public Function NumberDisplay(value As Double) As String
+        Return Localize(RoundDecimal(NumberInvariant(value)), True)
+    End Function
+    Public Function PercentRatioEdit(value As Double) As String
+        Return Localize(NumericCodec.Shift(NumberInvariant(value), 2), False, "", "%")
+    End Function
+    Public Function PercentRatioDisplay(value As Double) As String
+        Return Localize(RoundDecimal(NumericCodec.Shift(NumberInvariant(value), 2)), True, "", "%")
+    End Function
+    Public Function PercentPointsEdit(value As Double) As String
+        Return Localize(NumberInvariant(value), False, "", "%")
+    End Function
+    Public Function PercentPointsDisplay(value As Double) As String
+        Return Localize(RoundDecimal(NumberInvariant(value)), True, "", "%")
+    End Function
+
+    Private Shared Function Failure(state As FormatState, code As String, pos As Integer) As FormatAnalysis
+        Dim r As New FormatAnalysis()
+        r.State = state
+        r.Code = code
+        r.Position = pos
+        Return r
+    End Function
+
+    Private Function Analyze(text As String, kind As Integer) As FormatAnalysis
+        Dim length As Integer = String.Len(text)
+        If length = 0 Then Return NumericCodec.Failure(FormatState.Empty, "empty", 0)
+        If length > 1024 Then Return NumericCodec.Failure(FormatState.Invalid, "length", 1024)
+        Dim start As Integer = 0
+        Dim finish As Integer = length
+        Dim negative As Boolean = False
+        Dim missingClose As Boolean = False
+        If String.StartsWith(text, "-") Then
+            negative = True
+            start = 1
+        ElseIf String.StartsWith(text, "(") And Config.Accounting Then
+            negative = True
+            start = 1
+            If String.EndsWith(text, ")") Then
+                finish -= 1
+            Else
+                missingClose = True
+            End If
+        End If
+        If start = finish Then Return NumericCodec.Failure(FormatState.Incomplete, "incomplete", finish)
+        Dim missingCurrency As Boolean = False
+        If kind = 1 And Not Config.CurrencySuffix Then
+            Dim prefix As String = MoneyPrefix()
+            Dim available As String = String.Substring(text, start, finish - start)
+            If String.Compare(String.Left(available, String.Len(prefix)), prefix, True) <> 0 Then
+                If String.Compare(String.Left(prefix, String.Len(available)), available, True) = 0 Then Return NumericCodec.Failure(FormatState.Incomplete, "incomplete", finish)
+                Return NumericCodec.Failure(FormatState.Invalid, "syntax", start)
+            End If
+            start += String.Len(prefix)
+        End If
+        If kind = 1 And Config.CurrencySuffix Then
+            Dim suffix As String = MoneySuffix()
+            Dim available As String = String.Substring(text, start, finish - start)
+            If String.EndsWith(available, suffix, True) Then
+                finish -= String.Len(suffix)
+            Else
+                missingCurrency = True
+                For offset As Integer = 0 To String.Len(available) - 1
+                    Dim tail As String = String.Substring(available, offset)
+                    If String.Len(tail) < String.Len(suffix) And String.StartsWith(suffix, tail, True) Then
+                        finish = start + offset
+                        Exit For
+                    End If
+                Next
+            End If
+        End If
+        Dim missingPercent As Boolean = False
+        If kind >= 3 Then
+            If String.Substring(text, finish - 1, 1) = "%" Then
+                finish -= 1
+            Else
+                missingPercent = True
+            End If
+        End If
+        If start >= finish Then Return NumericCodec.Failure(FormatState.Incomplete, "incomplete", finish)
+        Dim canonical As String = ""
+        Dim fraction As Integer = -1
+        Dim groupLen As Integer = 0
+        Dim groups As Array Of Integer = []
+        Dim groupPositions As Array Of Integer = []
+        Dim totalDigits As Integer = 0
+        For i As Integer = start To finish - 1
+            Dim c As String = String.Substring(text, i, 1)
+            Dim cp As Integer = String.Asc(c)
+            If cp >= 48 And cp <= 57 Then
+                canonical += c
+                totalDigits += 1
+                If fraction >= 0 Then
+                    fraction += 1
+                    Dim limit As Integer = 340
+                    If kind = 0 Then limit = 0
+                    If kind = 1 Then limit = 4
+                    If fraction > limit Then Return NumericCodec.Failure(FormatState.Invalid, "precision", i)
+                Else
+                    groupLen += 1
+                End If
+            ElseIf String.Compare(c, Config.DecimalSeparator, True) = 0 And kind <> 0 And fraction < 0 Then
+                If groupLen = 0 Then Return NumericCodec.Failure(FormatState.Invalid, "syntax", i)
+                fraction = 0
+                canonical += "."
+            ElseIf String.Compare(c, Config.GroupingSeparator, True) = 0 And fraction < 0 And Config.Grouping Then
+                If groupLen = 0 Then Return NumericCodec.Failure(FormatState.Invalid, "grouping", i)
+                If Array.Count(groups) = 0 And String.Substring(text, start, 1) = "0" Then Return NumericCodec.Failure(FormatState.Invalid, "grouping", start)
+                Array.Append(groups, groupLen)
+                Array.Append(groupPositions, i)
+                groupLen = 0
+            Else
+                Return NumericCodec.Failure(FormatState.Invalid, "syntax", i)
+            End If
+        Next
+        If Array.Count(groups) > 0 Then
+            For i As Integer = 0 To Array.Count(groups) - 1
+                If (i = 0 And groups(i) > Config.SecondaryGroup) Or (i > 0 And groups(i) <> Config.SecondaryGroup) Then Return NumericCodec.Failure(FormatState.Invalid, "grouping", groupPositions(i))
+            Next
+            If groupLen <> Config.PrimaryGroup Then
+                If groupLen = 0 And fraction < 0 Then Return NumericCodec.Failure(FormatState.Incomplete, "incomplete", finish)
+                Return NumericCodec.Failure(FormatState.Invalid, "grouping", finish)
+            End If
+        End If
+        If fraction = 0 Or missingClose Or missingPercent Or missingCurrency Then Return NumericCodec.Failure(FormatState.Incomplete, "incomplete", finish)
+        If totalDigits = 0 Then Return NumericCodec.Failure(FormatState.Invalid, "syntax", start)
+        If negative Then canonical = "-" + canonical
+        Dim r As New FormatAnalysis()
+        r.Canonical = canonical
+        If kind <= 1 Then
+            Dim rawText As String = String.Replace(canonical, ".", "")
+            If kind = 1 Then
+                Dim n As Integer = fraction
+                If n < 0 Then n = 0
+                rawText += NumericCodec.Zeros(4 - n)
+            End If
+            Dim magnitude As Integer = 0
+            Dim lower As Integer = -9223372036854775807
+            If negative Then lower -= 1
+            Dim offset As Integer = 0
+            If negative Then offset = 1
+            For i As Integer = offset To String.Len(rawText) - 1
+                Dim digit As Integer = String.Asc(String.Substring(rawText, i, 1)) - 48
+                If magnitude < lower \ 10 Then Return NumericCodec.Failure(FormatState.Invalid, "overflow", finish)
+                magnitude *= 10
+                If magnitude < lower + digit Then Return NumericCodec.Failure(FormatState.Invalid, "overflow", finish)
+                magnitude -= digit
+            Next
+            If Not negative Then magnitude = -magnitude
+            If kind = 0 Then
+                r.IntegerValue = magnitude
+                r.Canonical = IntegerInvariant(magnitude)
+            Else
+                r.MoneyValue = Currency.FromMinorUnits(magnitude)
+                r.Canonical = MoneyInvariant(r.MoneyValue)
+            End If
+        Else
+            If kind = 3 Then canonical = NumericCodec.Shift(canonical, -2)
+            Dim parsed As Result Of Double, String = Double.Parse(canonical)
+            If Not parsed.IsOk Then Return NumericCodec.Failure(FormatState.Invalid, "overflow", finish)
+            If parsed.Value <> parsed.Value Or parsed.Value > 1.7976931348623157e308 Or parsed.Value < -1.7976931348623157e308 Then Return NumericCodec.Failure(FormatState.Invalid, "overflow", finish)
+            If parsed.Value = 0.0 And String.Replace(String.Replace(String.Replace(canonical, "-", ""), ".", ""), "0", "") <> "" Then Return NumericCodec.Failure(FormatState.Invalid, "underflow", finish)
+            r.NumberValue = parsed.Value
+            If r.NumberValue = 0.0 Then r.NumberValue = 0.0
+            r.Canonical = NumberInvariant(r.NumberValue)
+        End If
+        r.State = FormatState.Valid
+        r.Code = ""
+        r.Position = length
+        Return r
+    End Function
+    Public Function AnalyzeInteger(text As String) As FormatAnalysis
+        Return Analyze(text, 0)
+    End Function
+    Public Function AnalyzeMoney(text As String) As FormatAnalysis
+        Return Analyze(text, 1)
+    End Function
+    Public Function AnalyzeNumber(text As String) As FormatAnalysis
+        Return Analyze(text, 2)
+    End Function
+    Public Function AnalyzePercentRatio(text As String) As FormatAnalysis
+        Return Analyze(text, 3)
+    End Function
+    Public Function AnalyzePercentPoints(text As String) As FormatAnalysis
+        Return Analyze(text, 4)
+    End Function
+End Class
