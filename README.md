@@ -1,4 +1,4 @@
-# Localized number parse/format with explicit profiles
+# Localized number profiles
 
 `Import formatkit` (dependency: moneykit 0.1.0). `NumericCodec(New FormatProfile())`
 validates and copies the profile; `Profile()` and `FormatProfile.Clone()` return
