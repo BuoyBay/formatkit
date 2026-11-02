@@ -77,12 +77,8 @@ Untouched fields must retain their original typed value; do not parse display te
 on focus/blur or commit a display-rounded value. Edit APIs retain storage precision.
 Parent glue owns dirty-state tracking, date/time behavior and preference persistence.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 The renderer searches increasing scientific-mask precision and requires exact
 Double parse-back, trimming only redundant decimal zeros. This adapts to both
 Buoy 0.72's miscounted exponent placeholders and corrected counting; no fixed
 incorrect placeholder count is required. Ordinary edit text is `0.1` and `7.5%`,
-while difficult values retain enough digits to round-trip. The independent oracle
-searches 1..17 significant digits using Python's binary64 formatter. The retained
-scientific probe records upstream behavior without requiring the old defect.
+while difficult values retain enough digits to round-trip. Round-tripping difficult values may require up to 17 significant decimal digits.
