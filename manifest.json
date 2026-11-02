@@ -1,1 +1,1 @@
-{"schema":1,"name":"formatkit","version":"0.1.0","description":"Strict localized numeric codecs and snapshot profiles"}
+{"schema":1,"name":"formatkit","version":"0.1.0","description":"Parse and format localized numbers with explicit profiles"}
